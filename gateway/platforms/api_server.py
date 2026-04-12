@@ -551,23 +551,48 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
 
+        def _extract_text_from_content(content: Any) -> str:
+            """Extract text from OpenAI content array or return string as-is."""
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") in ("text", "input_text"):
+                            text_parts.append(part.get("text", ""))
+                        elif part.get("type") in ("image_url", "input_image"):
+                            img_url = part.get("image_url", {})
+                            if isinstance(img_url, dict):
+                                text_parts.append(img_url.get("url", ""))
+                            else:
+                                text_parts.append(str(img_url))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                return "\n".join(text_parts)
+            return str(content) if content else ""
+
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "system":
                 # Accumulate system messages
+                text = _extract_text_from_content(content)
                 if system_prompt is None:
-                    system_prompt = content
+                    system_prompt = text
                 else:
-                    system_prompt = system_prompt + "\n" + content
+                    system_prompt = system_prompt + "\n" + text
             elif role in ("user", "assistant"):
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
         user_message = ""
+        last_msg_content = None  # Store original content array if present
         history = []
         if conversation_messages:
-            user_message = conversation_messages[-1].get("content", "")
+            last_msg = conversation_messages[-1]
+            last_msg_content = last_msg.get("content")
+            user_message = _extract_text_from_content(last_msg_content)
             history = conversation_messages[:-1]
 
         if not user_message:

@@ -7639,7 +7639,8 @@ class AIAgent:
                 self._turns_since_memory = 0
 
         # Add user message
-        user_msg = {"role": "user", "content": user_message}
+        user_msg_content = user_message if isinstance(user_message, list) else user_message
+        user_msg = {"role": "user", "content": user_msg_content}
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx
