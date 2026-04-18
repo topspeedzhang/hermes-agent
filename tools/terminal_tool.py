@@ -1738,6 +1738,22 @@ def _handle_terminal(args, **kw):
     )
 
 
+# ---------------------------------------------------------------------------
+# Auto-timeout hook — run once when this module is imported
+# ---------------------------------------------------------------------------
+try:
+    import sys as _sys
+    _scripts_dir = "/Users/zhangxicen/.hermes/scripts"
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    from auto_timeout_hook import _timeout_handler as _hook_cb
+    from tools.environments.base import register_timeout_hook
+
+    register_timeout_hook(_hook_cb)
+except Exception:
+    # Best-effort — terminal tool works fine without the hook
+    _hook_cb = None
+
 registry.register(
     name="terminal",
     toolset="terminal",

@@ -23,6 +23,42 @@ from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Timeout hook registry — allows tools/agent to register callbacks that fire
+# automatically when a terminal command times out.  Each callback receives:
+#   (command: str, elapsed_seconds: int, output: str, workspace: str) -> None
+# Callbacks are invoked synchronously inside _wait_for_process, so they must
+# NOT block (use threads if you need to do heavy work).
+# ---------------------------------------------------------------------------
+_timeout_hooks: list[Callable[[str, int, str, str], None]] = []
+
+
+def register_timeout_hook(
+    cb: Callable[[str, int, str, str], None]
+) -> None:
+    """Register a callback to fire when a terminal command times out.
+
+    Idempotent: registering the same callable twice is a no-op (deduped by identity).
+    """
+    for existing in _timeout_hooks:
+        if existing is cb:
+            return
+    _timeout_hooks.append(cb)
+
+
+def _fire_timeout_hooks(
+    command: str, elapsed: int, output: str, workspace: str
+) -> None:
+    """Fire all registered timeout hooks in background threads (non-blocking)."""
+    for cb in _timeout_hooks:
+        def _run(cb=cb):
+            try:
+                cb(command, elapsed, output, workspace)
+            except Exception:
+                pass
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
@@ -379,26 +415,29 @@ class BaseEnvironment(ABC):
     # Process lifecycle
     # ------------------------------------------------------------------
 
-    def _wait_for_process(self, proc: ProcessHandle, timeout: int = 120) -> dict:
-        """Poll-based wait with interrupt checking and stdout draining.
+    def _wait_for_process(
+        self,
+        proc: ProcessHandle,
+        timeout: int,
+        command: str = "",
+        workspace: str = "",
+    ) -> dict:
+        """Wait for *proc* to finish, respecting *timeout* and thread interrupts.
 
-        Shared across all backends — not overridden.
-
-        Fires the ``activity_callback`` (if set on this instance) every 10s
-        while the process is running so the gateway's inactivity timeout
-        doesn't kill long-running commands.
+        On timeout, fires any registered _timeout_hooks before returning.
+        *command* and *workspace* are passed to the hooks for context.
         """
         output_chunks: list[str] = []
+        output_lock = threading.Lock()
 
         def _drain():
             try:
-                for line in proc.stdout:
-                    output_chunks.append(line)
-            except UnicodeDecodeError:
-                output_chunks.clear()
-                output_chunks.append(
-                    "[binary output detected — raw bytes not displayable]"
-                )
+                while True:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    with output_lock:
+                        output_chunks.append(chunk)
             except (ValueError, OSError):
                 pass
 
@@ -421,10 +460,16 @@ class BaseEnvironment(ABC):
                 drain_thread.join(timeout=2)
                 partial = "".join(output_chunks)
                 timeout_msg = f"\n[Command timed out after {timeout}s]"
-                return {
-                    "output": partial + timeout_msg
+                result_output = (
+                    partial + timeout_msg
                     if partial
-                    else timeout_msg.lstrip(),
+                    else timeout_msg.lstrip()
+                )
+                # Fire timeout hooks in background threads (non-blocking)
+                actual_elapsed = int(time.monotonic() - (deadline - timeout))
+                _fire_timeout_hooks(command, actual_elapsed, partial, workspace)
+                return {
+                    "output": result_output,
                     "returncode": 124,
                 }
             # Periodic activity touch so the gateway knows we're alive
@@ -552,7 +597,12 @@ class BaseEnvironment(ABC):
         proc = self._run_bash(
             wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
         )
-        result = self._wait_for_process(proc, timeout=effective_timeout)
+        result = self._wait_for_process(
+            proc,
+            timeout=effective_timeout,
+            command=command,
+            workspace=effective_cwd,
+        )
         self._update_cwd(result)
 
         return result

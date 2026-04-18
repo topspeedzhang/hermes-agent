@@ -3342,7 +3342,9 @@ class AIAgent:
                     role,
                 )
                 continue
-            filtered.append(msg)
+            # Strip internal Hermes-only metadata fields before sending to API.
+            cleaned = {k: v for k, v in msg.items() if not k.startswith("_")}
+            filtered.append(cleaned)
         messages = filtered
 
         surviving_call_ids: set = set()
@@ -7572,6 +7574,27 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
+            # Auto-retry: if this was the optimised command we injected,
+            # mark the retry done so it's not injected again on next turn.
+            # Only auto-done terminal tools (which is what gets optimised).
+            # Guard: only clear if the tool result is non-empty (indicating the
+            # command actually ran — empty result means the tool was skipped/died).
+            _pending_id = getattr(self, "_auto_retry_pending_id", None)
+            if _pending_id and function_name == "terminal" and function_result.strip():
+                try:
+                    import sys as _sys
+                    _scripts_dir = "/Users/zhangxicen/.hermes/scripts"
+                    if _scripts_dir not in _sys.path:
+                        _sys.path.insert(0, _scripts_dir)
+                    from auto_retry_manager import mark_retry_done
+                    # Only mark done if the command appears to have succeeded
+                    # (no error indicator in the first 200 chars)
+                    if "error" not in function_result.lower()[:200]:
+                        mark_retry_done(_pending_id)
+                        self._auto_retry_pending_id = None
+                except Exception:
+                    pass  # best-effort
+
             if not self.quiet_mode:
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -7862,6 +7885,8 @@ class AIAgent:
         self._last_content_with_tools = None
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
+        self._auto_retry_already_handled = False  # Guard: inject retry msg only once per turn
+        self._auto_retry_pending_id: Optional[str] = None  # ID of injected retry (for auto-done)
 
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
@@ -8125,9 +8150,43 @@ class AIAgent:
             except Exception:
                 pass
 
+        # ── Auto-retry: check for pending timeout retries ──────────────────────
+        # If a previous terminal command timed out, auto_retry_manager writes a
+        # JSON file.  We check for it here and inject a user message that tells
+        # the agent to run the optimised command before resuming the original task.
+        # Only inject once per run_conversation call — guard with an instance flag.
+        _auto_retry_injected = False
+        _auto_retry_id = ""
+        if not getattr(self, "_auto_retry_already_handled", False):
+            try:
+                import sys as _sys
+                _scripts_dir = "/Users/zhangxicen/.hermes/scripts"
+                if _scripts_dir not in _sys.path:
+                    _sys.path.insert(0, _scripts_dir)
+                from auto_retry_manager import check_and_inject
+                _auto_retry_injected = check_and_inject(
+                    messages,
+                    workspace=effective_task_id or "/tmp",
+                )
+                if _auto_retry_injected and messages:
+                    for msg in reversed(messages):
+                        if msg.get("_auto_retry_inject"):
+                            _auto_retry_id = msg.get("_retry_id", "")
+                            self._auto_retry_pending_id = _auto_retry_id
+                            break
+                    # Mark handled so we never inject twice in the same run_conversation
+                    self._auto_retry_already_handled = True
+            except Exception as _exc:
+                import logging as _logging
+                _logging.warning("auto_retry check failed: %s", _exc)
+
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
+
+            # Auto-retry: reset per-turn state so a new injection can happen
+            # if the previous turn's injected command succeeded and cleared it
+            self._auto_retry_pending_id: Optional[str] = None
 
             # Check for interrupt request (e.g., user sent new message)
             if self._interrupt_requested:
