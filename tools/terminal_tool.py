@@ -147,6 +147,25 @@ def _check_all_guards(command: str, env_type: str) -> dict:
                                   approval_callback=_approval_callback)
 
 
+def _check_command_standards(command: str, background: Optional[bool] = None,
+                             timeout: Optional[int] = None) -> dict:
+    """
+    Thin wrapper that delegates to the command_standards module.
+    The actual standards logic lives in scripts/command_standards.py so it can
+    be maintained without touching the hermes-agent codebase.
+    """
+    try:
+        import sys as _sys
+        _scripts_dir = "/Users/zhangxicen/.hermes/scripts"
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from command_standards import check_command_standards as _cs_check
+        return _cs_check(command, background=background, timeout=timeout)
+    except Exception:
+        # Best-effort: if standards check fails, allow the command through
+        return {"pass": True}
+
+
 # Allowlist: characters that can legitimately appear in directory paths.
 # Covers alphanumeric, path separators, tilde, dot, hyphen, underscore, space,
 # plus, at, equals, and comma.  Everything else is rejected.
@@ -1318,6 +1337,24 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+
+        # ── Command Standards check ──────────────────────────────────────────
+        # Run standards check after dangerous-command guard so we don't
+        # inspect truly dangerous commands (they were already blocked above).
+        # The standards check catches non-dangerous commands that would
+        # block, hang, or misbehave (missing timeout, missing nohup, etc).
+        standards_result = _check_command_standards(command, background=background, timeout=timeout)
+        if not standards_result.get("pass"):
+            err = standards_result.get("error", "command violates execution standards")
+            suggestion = standards_result.get("suggestion", "")
+            logger.warning("Command standards violation: %s — %s", err, suggestion)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": f"[Command Standards] {err}. {suggestion}".strip(),
+                "status": "standards_violation",
+                "suggestion": suggestion,
+            }, ensure_ascii=False)
 
         # Validate workdir against shell injection
         if workdir:
