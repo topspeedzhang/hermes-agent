@@ -147,23 +147,88 @@ def _check_all_guards(command: str, env_type: str) -> dict:
                                   approval_callback=_approval_callback)
 
 
+def _get_command_standards_module():
+    """
+    Locate and import command_standards.py with a multi-path fallback chain.
+    
+    Fallback order:
+      1. HERMES_HOME/scripts/command_standards.py
+      2. __file__-relative ../scripts/
+      3. ~/.hermes/hermes-agent/scripts/
+      4. ~/.hermes/scripts/
+    
+    Raises ImportError if none are found (caller must handle fail-secure).
+    """
+    import os
+    import sys
+    import importlib.util
+
+    candidates = []
+
+    # 1. HERMES_HOME environment variable (highest priority — explicit override)
+    hermes_home = os.environ.get("HERMES_HOME", "")
+    if hermes_home:
+        candidates.append(os.path.join(hermes_home, "scripts", "command_standards.py"))
+
+    # 2. __file__-relative (works in both venv and source trees)
+    if "__file__" in globals():
+        candidates.append(os.path.join(os.path.dirname(__file__), "scripts", "command_standards.py"))
+
+    # 3. User dotfiles paths (user-writable, multi-user safe)
+    candidates.append(os.path.expanduser("~/.hermes/hermes-agent/scripts/command_standards.py"))
+    candidates.append(os.path.expanduser("~/.hermes/scripts/command_standards.py"))
+
+    # 4. Explicit known production path (last resort — hardcoded, single-user)
+    candidates.append("/Users/zhangxicen/.hermes/hermes-agent/scripts/command_standards.py")
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for p in candidates:
+        norm = os.path.normpath(p)
+        if norm not in seen and os.path.isfile(norm):
+            seen.add(norm)
+            unique.append(norm)
+
+    if not unique:
+        raise ImportError("command_standards.py not found in any fallback path")
+
+    # Load from the first available candidate
+    spec = importlib.util.spec_from_file_location("_cs_check", unique[0])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_cs_check_module"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _check_command_standards(command: str, background: Optional[bool] = None,
                              timeout: Optional[int] = None) -> dict:
     """
     Thin wrapper that delegates to the command_standards module.
-    The actual standards logic lives in scripts/command_standards.py so it can
-    be maintained without touching the hermes-agent codebase.
+    Implements fail-secure: import/runtime errors → deny by default.
     """
     try:
+        module = _get_command_standards_module()
+        return module.check_command_standards(command, background=background, timeout=timeout)
+    except ImportError as e:
+        # Layer 4 (L4): fail-secure — standards module unavailable → deny
         import sys as _sys
-        _scripts_dir = "/Users/zhangxicen/.hermes/scripts"
-        if _scripts_dir not in _sys.path:
-            _sys.path.insert(0, _scripts_dir)
-        from command_standards import check_command_standards as _cs_check
-        return _cs_check(command, background=background, timeout=timeout)
-    except Exception:
-        # Best-effort: if standards check fails, allow the command through
-        return {"pass": True}
+        import os as _os
+        _os.write(2, f"[command_standards] ImportError (fail-secure deny): {e}\n".encode())
+        return {
+            "pass": False,
+            "error": "Command-standards module unavailable — blocking command for safety",
+            "suggestion": "Install/reload the hermes-agent skills bundle",
+        }
+    except Exception as e:
+        import sys as _sys
+        import os as _os
+        _os.write(2, f"[command_standards] Unexpected error (fail-secure deny): {e}\n".encode())
+        return {
+            "pass": False,
+            "error": f"Command-standards check failed: {e}",
+            "suggestion": "This command was blocked because the standards checker encountered an error.",
+        }
 
 
 # Allowlist: characters that can legitimately appear in directory paths.

@@ -477,8 +477,9 @@ def generate_optimized_command(retry: PendingRetry) -> Optional[str]:
             return with_timeout(cmd + " -j 1", retry.expected)
         return None
 
-    # ── Default: add timeout wrapper ────────────────────────────────
-    if retry.severity in ("low", "medium") and retry.progress.get("progress", 0) > 0:
+    # ── Default: add timeout wrapper for any stalled command ────────────
+    # severity==high still needs timeout guard; severity check doesn't apply here
+    if retry.progress.get("progress", 0) > 0 or retry.cause in ("slow_progress", "no_output", "unknown"):
         for s in retry.suggestions:
             if "timeout" in s.lower() or "增加" in s or "increase" in s.lower():
                 if not cmd.startswith("timeout "):
